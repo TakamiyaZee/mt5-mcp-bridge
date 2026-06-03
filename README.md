@@ -61,10 +61,10 @@ Two-tier design:
 |------|-------------|
 | `calculate_kelly_position` | Position sizing via Kelly criterion |
 | `validate_trade_signal` | Pre-trade checks (spread, stops, volatility) |
-| `get_technical_indicators` | RSI, MACD, Bollinger, SMA, ATR |
+| `get_technical_indicators` | RSI, MACD, Bollinger Bands, SMA, ATR |
 | `calculate_symbol_correlation` | Correlation matrix |
 | `check_news_blackout` | Economic calendar blackout check |
-| `get_portfolio_risk_snapshot` | VaR, exposure, daily P&L, breaches |
+| `get_portfolio_risk_snapshot` | Portfolio VaR, exposure, daily P&L, breaches |
 | `get_market_regime` | Trend/range detection |
 
 ### Economic Calendar Tools (3)
@@ -75,6 +75,19 @@ Two-tier design:
 | `get_economic_calendar_date` | Specific date |
 
 **Total: 28 MCP tools**
+
+---
+
+## ⚠️ Trading Logic Disclaimer
+
+The included trading orchestrators (`hedge_orchestrator.py` and `run_trading_cycle.py`) contain **placeholder signal generation logic** and are intended for **demonstration and testing purposes only**.
+
+**Do not use these scripts for live trading without:**
+- Replacing the signal generation with your own validated strategy
+- Thoroughly testing in a demo environment
+- Confirming position sizing, risk limits, and order execution meet your requirements
+
+The MCP server itself (`server.py`) is production-ready for exposing MT5 functionality via MCP tools. The trading logic is provided as an example scaffold.
 
 ---
 
@@ -98,8 +111,7 @@ WINEPREFIX=$HOME/.mt5 wine "C:\\Python311\\python.exe" -m pip install \
 ### Set Credentials (always via env, never hardcode)
 ```bash
 export MT5_LOGIN=12345678
-export MT5_PASSWORD=your_p...n
-export MT5_SERVER=YourBroker-Server
+export MT5_PASSWORD=your_p...port MT5_SERVER=YourBroker-Server
 ```
 
 ### Start Bridge
@@ -113,7 +125,59 @@ bash start-mt5-bridge.sh
 python3 server.py
 ```
 
----
+### Register with Hermes (optional)
+```yaml
+# ~/.hermes/config.yaml
+mcp_servers:
+  metatrader:
+    command: python3
+    args: [/path/to/server.py]
+    enabled: true
+    timeout: 180
+    connect_timeout: 30
+```
+
+## Hedge Fund Quant System (Example Scaffold)
+
+Multi-agent trading pipeline at `run_trading_cycle.py` and `hedge_orchestrator.py`:
+
+```
+Cron Tick → [MarketIntel || EconCalendar || TechAnalysis]
+          → RiskManager → PortfolioManager → Execution
+```
+
+### Agent Workflow (agents/ directory)
+- `01_market_intel.md` — Geopolitical & macro risk analysis
+- `02_econ_calendar.md` — Economic data parser
+- `03_tech_analysis.md` — Quant TA signal generator
+- `04_risk_manager.md` — Position sizing & filters
+- `05_portfolio_manager.md` — Capital allocation
+
+### Risk Parameters (from configs)
+- Max 1% risk/trade, 5% symbol exposure, 3% daily loss
+- Min RR 1.5:1, Kelly fraction 0.25
+- Correlation filter: max 2 same-direction correlated pairs
+- 15-minute news blackout pre/post high-impact events
+
+### Important Notes on Example Logic
+- Signal generation in these examples is **simplified** (price-based direction only)
+- Position sizing has been improved to use symbol-specific tick values
+- Dry-run mode in orchestrator now **truly skips execution**
+- Order filling defaults to `ORDER_FILLING_FOK` (broker compatible)
+- SL/TP validation ensures correct directional stops
+- Zero SL/TP values are omitted to avoid broker rejections
+
+### Run the Cycle
+```bash
+# Dry run (no execution)
+python3 run_trading_cycle.py --dry-run
+
+# Status check
+python3 run_trading_cycle.py --status
+
+# Live (uses placeholder signals — NOT recommended for production)
+python3 run_trading_cycle.py
+```
 
 ## MCP Client Integration
 
@@ -151,49 +215,6 @@ Then in Hermes session: `/reload-mcp` → `hermes mcp test metatrader`
 Any MCP client that supports **stdio transport** can use this server directly:
 ```bash
 python3 /path/to/mt5-mcp-bridge/server.py
-```
-
----
-
-## Hedge Fund Quant System
-
-Multi-agent trading pipeline in `run_trading_cycle.py`:
-
-```
-Tick → [MarketIntel | EconCalendar | TechAnalysis]
-     → RiskManager → PortfolioManager → Execution
-```
-
-### Agent Prompts (`agents/`)
-| File | Role |
-|------|------|
-| `01_market_intel.md` | Geopolitical & macro risk analysis |
-| `02_econ_calendar.md` | Economic calendar parser (NFP, CPI, Fed) |
-| `03_tech_analysis.md` | Quant TA signals (RSI, MACD, patterns) |
-| `04_risk_manager.md` | Position sizing, filters, correlation |
-| `05_portfolio_manager.md` | Capital allocation, hedging |
-
-### Risk Parameters
-| Parameter | Value |
-|-----------|-------|
-| Max risk per trade | 1% |
-| Max symbol exposure | 5% |
-| Max daily loss | 3% |
-| Min risk-reward | 1.5:1 |
-| Kelly fraction | 0.25 (conservative) |
-| Correlation limit | 0.70 |
-| News blackout | ±15 min high-impact events |
-
-### Run the Cycle
-```bash
-# Dry run (no execution)
-python3 run_trading_cycle.py --dry-run
-
-# Status check
-python3 run_trading_cycle.py --status
-
-# Live
-python3 run_trading_cycle.py
 ```
 
 ---
