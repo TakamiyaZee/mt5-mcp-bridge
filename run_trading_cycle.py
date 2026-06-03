@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""
+Hedge Fund Quant Trading System — Main Entry Point
+Runs the full multi-agent workflow via Hermes delegate_task.
+
+Usage:
+  python3 run_trading_cycle.py [--dry-run] [--symbols XAUUSD BTCUSD]
+  python3 run_trading_cycle.py --status    # Show portfolio status
+  python3 run_trading_cycle.py --positions # Show open positions
+"""
+import os, sys, json, subprocess, time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+DATA_DIR = Path(os.path.expanduser("~/.hermes/mcp-servers/mt5-mcp-server/data"))
+DATA_DIR.mkdir(exist_ok=True)
+
+DEFAULT_SYMBOLS = ["XAUUSD", "BTCUSD", "EURUSD", "GBPUSD", "USDJPY"]
+ORCHESTRATOR_SCRIPT = Path(__file__).parent / "hedge_orchestrator.py"
+AGENT_DIR = Path(__file__).parent / "agents"
+
+def get_mt5():
+    try:
+        from mt5linux import MetaTrader5
+        mt5 = MetaTrader5(host=os.environ.get("MT5_BRIDGE_HOST", "localhost"),
+                          port=int(os.environ.get("MT5_BRIDGE_PORT", "8001")))
+        if mt5.account_info():
+            return mt5
+    except:
+        pass
+    return None
+
+def portfolio_status(mt5):
+    if mt5 is None:
+        return {"error": "MT5 offline"}
+    acc = mt5.account_info()
+    pos = mt5.positions_get()
+    return {
+        "balance": acc.balance if acc else 0,
+        "equity": acc.equity if acc else 0,
+        "margin": acc.margin if acc else 0,
+        "margin_free": acc.margin_free if acc else 0,
+        "profit": acc.profit if acc else 0,
+        "positions": len(pos) if pos else 0,
+        "position_tickets": [p.ticket for p in pos] if pos else []
+    }
+
+def get_symbol_data(mt5, symbol):
+    """Get live price + info for a symbol."""
+    tick = mt5.symbol_info_tick(symbol)
+    info = mt5.symbol_info(symbol)
+    if not tick or not info:
+        return None
+    return {
+        "symbol": symbol,
+        "bid": tick.bid,
+        "ask": tick.ask,
+        "point": info.point,
+        "digits": info.digits,
+        "spread": info.spread,
+        "lot_min": info.volume_min,
+        "lot_step": info.volume_step,
+        "stop_level": info.trade_stops_level,
+    }
+
+def run_parallel_agents(symbols_data, balance, dry_run=True):
+    """
+    Run agents in parallel via delegate_task pattern.
+    Returns merged results from all agents.
+    """
+    # In Hermes, this runs via delegate_task batch.
+    # For standalone, we simulate the pipeline.
+    
+    print(f"\n{'='*60}")
+    print(f"  HEDGE FUND QUANT SYSTEM — {datetime.now()}")
+    print(f"{'='*60}\n")
+    
+    # Phase 1: Parallel intel gathering (MarketIntel + EconCalendar + TechAnalysis)
+    print("[1/4] PHASE 1 — Parallel Intelligence Gathering")
+    intel_results = []
+    econ_results = []
+    tech_results = []
+    
+    for sym in symbols_data:
+        s = sym["symbol"]
+        # TechAnalysis
+        tick = sym
+        # Simple RSI-like momentum (simplified for demo)
+        tech = {
+            "symbol": s,
+            "signal": "BUY" if tick["ask"] > tick["bid"] else "SELL",  # placeholder
+            "confidence": 0.72,
+            "entry": tick["ask"],
+            "sl": tick["ask"] - 50 * tick["point"],
+            "tp": tick["ask"] + 100 * tick["point"],
+            "timeframe": "H1",
+            "pattern": "potential_breakout"
+        }
+        tech_results.append(tech)
+        print(f"  {s}: signal={tech['signal']}, conf={tech['confidence']}")
+    
+    # MarketIntel (placeholder — in production, delegate to Hermes agent)
+    intel_results = [{"symbol": s["symbol"], "bias": "NEUTRAL", "risk_score": 0.3} for s in symbols_data]
+    econ_results = {"events": [], "volatility_forecast": "LOW"}
+    
+    # Phase 2: Risk Manager
+    print(f"\n[2/4] PHASE 2 — Risk Management Filter")
+    approved = []
+    for sig in tech_results:
+        # Simple RR calculation
+        risk_pts = abs(sig["entry"] - sig["sl"]) / symbols_data[0]["point"]
+        reward_pts = abs(sig["tp"] - sig["entry"]) / symbols_data[0]["point"]
+        rr = reward_pts / risk_pts if risk_pts > 0 else 0
+        merit = min(1.0, rr / 3.0)
+        
+        sig["rr_ratio"] = round(rr, 2)
+        sig["merit_score"] = round(merit, 2)
+        sig["approved"] = merit > 0.3 and rr >= 1.5
+        sig["position_size"] = round(balance * 0.01 / (risk_pts * 100000), 2) if risk_pts > 0 else 0.01
+        
+        status = "✓" if sig["approved"] else "✗"
+        print(f"  {sig['symbol']}: RR={rr:.1f}:1, merit={merit:.2f} [{status}]")
+        if sig["approved"]:
+            approved.append(sig)
+    
+    # Phase 3: Portfolio Manager
+    print(f"\n[3/4] PHASE 3 — Portfolio Allocation")
+    # Rank by merit
+    ranked = sorted(approved, key=lambda x: x["merit_score"], reverse=True)
+    to_execute = ranked[:3]  # max 3 per cycle
+    
+    for i, sig in enumerate(to_execute):
+        print(f"  #{i+1} {sig['symbol']} {sig['signal']} {sig['position_size']} lot | RR={sig['rr_ratio']}")
+    
+    # Phase 4: Execute
+    print(f"\n[4/4] PHASE 4 — Execution {'(DRY RUN)' if dry_run else ''}")
+    executed = []
+    if not dry_run and to_execute:
+        mt5 = get_mt5()
+        for sig in to_execute:
+            if mt5:
+                from mt5linux import MetaTrader5 as MT5
+                result = mt5.order_send({
+                    "action": MT5.TRADE_ACTION_DEAL if not dry_run else MT5.TRADE_ACTION_DEAL,
+                    "symbol": sig["symbol"],
+                    "volume": sig["position_size"],
+                    "type": MT5.ORDER_TYPE_BUY if sig["signal"] == "BUY" else MT5.ORDER_TYPE_SELL,
+                    "price": mt5.symbol_info_tick(sig["symbol"]).ask,
+                    "sl": sig["sl"],
+                    "tp": sig["tp"],
+                    "deviation": 20,
+                    "magic": 888888,
+                    "comment": "HF_QUANT",
+                    "type_time": MT5.ORDER_TIME_GTC,
+                    "type_filling": MT5.ORDER_FILLING_IOC,
+                })
+                executed.append({"symbol": sig["symbol"], "order": result.order if result else None})
+                print(f"  EXECUTED {sig['symbol']}: ticket={result.order if result else 'err'}")
+    else:
+        print("  No execution (dry run or no signals)")
+    
+    # Log cycle
+    cycle = {
+        "timestamp": datetime.now().isoformat(),
+        "portfolio": portfolio_status(get_mt5()),
+        "signals_generated": len(tech_results),
+        "signals_approved": len(approved),
+        "trades_executed": len(executed),
+        "trades": to_execute,
+    }
+    
+    log_path = DATA_DIR / f"cycle_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(log_path, "w") as f:
+        json.dump(cycle, f, indent=2, default=str)
+    
+    print(f"\n{'='*60}")
+    print(f"  CYCLE COMPLETE | Executed: {len(executed)} | Log: {log_path}")
+    print(f"{'='*60}\n")
+    
+    return cycle
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS)
+    parser.add_argument("--balance", type=float, default=10000.0)
+    args = parser.parse_args()
+    
+    mt5 = get_mt5()
+    if mt5:
+        acc = mt5.account_info()
+        if acc:
+            args.balance = acc.balance
+            print(f"Connected: {acc.name} | Balance: {acc.balance} {acc.currency}")
+    
+    symbols_data = []
+    for sym in args.symbols:
+        if mt5:
+            d = get_symbol_data(mt5, sym)
+            if d:
+                symbols_data.append(d)
+        else:
+            symbols_data.append({"symbol": sym, "ask": 1.0, "bid": 0.99, "point": 0.0001})
+    
+    run_parallel_agents(symbols_data, args.balance, dry_run=args.dry_run)

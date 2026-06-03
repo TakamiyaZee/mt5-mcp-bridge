@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (trading cycle logs, training data)
+data/
+*.jsonl
+*.log
+
+# Trading
+common.ini
+terminal.ini
+
+# ML models
+*.pkl
+*.h5
+*.joblib
