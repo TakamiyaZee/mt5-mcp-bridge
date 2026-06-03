@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """MT5 MCP Server — stdio transport for Hermes."""
-import os, sys, logging
+import os, sys, logging, zoneinfo
+from datetime import datetime, timedelta
 logging.basicConfig(level=logging.WARNING)
+logging.getLogger("mt5linux").setLevel(logging.ERROR)
 
 from mcp.server.fastmcp import FastMCP, Context
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Union, List, Dict
 
 from mt5linux import MetaTrader5
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from typing import Optional, Union, List, Dict
 
 _mt5 = None
+_mt5_ok = False
 _EARNINGS_API_KEY = os.environ.get("EARNINGS_API_KEY", "")
 
 # --- Risk Parameters (Institutional Grade) ---
@@ -29,13 +30,39 @@ KELLY_FRACTION = 0.25          # Kelly multiplier for safety
 
 def get_mt5():
     global _mt5
+    global _mt5_ok
     if _mt5 is None:
         host = os.environ.get("MT5_BRIDGE_HOST", "localhost")
         port = int(os.environ.get("MT5_BRIDGE_PORT", "8001"))
-        _mt5 = MetaTrader5(host=host, port=port)
-        if _mt5.account_info() is None:
-            raise ConnectionError(f"Cannot connect to MT5 bridge at {host}:{port}")
+        try:
+            _mt5 = MetaTrader5(host=host, port=port)
+            _mt5_ok = _mt5.account_info() is not None
+            if not _mt5_ok:
+                logging.warning(f"MT5 bridge at {host}:{port} unreachable — tools return degraded responses")
+        except Exception as e:
+            logging.warning(f"MT5 bridge connection failed: {e}")
+            _mt5 = None
+            _mt5_ok = False
+    if not _mt5_ok:
+        raise ConnectionError(f"MT5 bridge offline (host={host}:{port})")
     return _mt5
+
+def _sltp_valid(symbol, side, entry, sl, tp):
+    """Validate SL/TP direction for BUY/SELL. Returns (valid: bool, reason: str)."""
+    if side.upper() not in ("BUY", "SELL"):
+        return False, f"Invalid side: {side}"
+    if sl is not None and sl > 0 and tp is not None and tp > 0:
+        if side.upper() == "BUY":
+            if not (sl < entry < tp):
+                return False, f"BUY requires SL < entry < TP (got sl={sl} entry={entry} tp={tp})"
+        else:
+            if not (tp < entry < sl):
+                return False, f"SELL requires TP < entry < SL (got tp={tp} entry={entry} sl={sl})"
+    return True, "OK"
+
+def _filling_mode():
+    """Return broker-appropriate filling mode. HF Markets requires FOK."""
+    return int(os.environ.get("ORDER_FILLING_MODE", "1"))  # default FOK (1)
 
 @dataclass
 class AppCtx:
@@ -144,36 +171,47 @@ def get_pending_orders_by_symbol(ctx: Context, symbol: str) -> str:
 
 @mcp.tool()
 def open_position(ctx: Context, symbol: str, volume: float, type: str,
-                  sl: Optional[float] = 0.0, tp: Optional[float] = 0.0,
+                  sl: Optional[float] = None, tp: Optional[float] = None,
                   deviation: int = 20, magic: int = 0, comment: str = "mcp") -> dict:
     """
     Open a market position. Parameters:
       symbol:  e.g. 'EURUSD'
       volume:  lot size e.g. 0.01
       type:    'BUY' or 'SELL'
-      sl:      stop loss price (0 = none)
-      tp:      take profit price (0 = none)
+      sl:      stop loss price (omit or None for none)
+      tp:      take profit price (omit or None for none)
       deviation: max slippage in points
       magic:   EA magic number
       comment: order comment
     """
     mt5 = get_mt5()
-    price = _tick_price(symbol, "ask" if type.upper() == "BUY" else "bid")
-    type_int = mt5.ORDER_TYPE_BUY if type.upper() == "BUY" else mt5.ORDER_TYPE_SELL
+    side = type.upper()
+    price = _tick_price(symbol, "ask" if side == "BUY" else "bid")
+    type_int = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
+
+    # Validate SL/TP direction
+    valid, reason = _sltp_valid(symbol, side, price, sl, tp)
+    if not valid:
+        return {"error": reason, "retcode": -1}
+
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
         "volume": volume,
         "type": type_int,
         "price": price,
-        "sl": sl,
-        "tp": tp,
         "deviation": deviation,
         "magic": magic,
         "comment": comment,
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": _filling_mode(),
     }
+    # Omit sl/tp keys if None/0 to avoid broker reject
+    if sl is not None and sl > 0:
+        request["sl"] = sl
+    if tp is not None and tp > 0:
+        request["tp"] = tp
+
     result = mt5.order_send(request)
     if result is None:
         return {"error": str(mt5.last_error())}
@@ -213,7 +251,7 @@ def close_position(ctx: Context, id: Union[int, str], deviation: int = 20) -> di
         "magic": pos.magic,
         "comment": "mcp close",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": _filling_mode(),
     }
     result = mt5.order_send(request)
     if result is None:
@@ -245,7 +283,7 @@ def close_all_positions(ctx: Context, deviation: int = 20) -> list:
             "magic": pos.magic,
             "comment": "mcp close all",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": _filling_mode(),
         }
         result = mt5.order_send(request)
         d = _result_dict(result) if result else {"error": str(mt5.last_error())}
@@ -273,6 +311,13 @@ def modify_position(ctx: Context, id: Union[int, str],
         return {"error": f"Position {id} not found"}
     new_sl = sl if sl is not None else pos.sl
     new_tp = tp if tp is not None else pos.tp
+
+    # Direction-aware validation for modify
+    side = "BUY" if pos.type == 0 else "SELL"
+    valid, reason = _sltp_valid(pos.symbol, side, pos.price_open, new_sl, new_tp)
+    if not valid:
+        return {"error": reason, "retcode": -1}
+
     request = {
         "action": mt5.TRADE_ACTION_SLTP,
         "position": id,
@@ -295,7 +340,7 @@ def modify_position(ctx: Context, id: Union[int, str],
 
 @mcp.tool()
 def place_pending_order(ctx: Context, symbol: str, volume: float, type: str,
-                        price: float, sl: float = 0.0, tp: float = 0.0,
+                        price: float, sl: Optional[float] = None, tp: Optional[float] = None,
                         deviation: int = 20, magic: int = 0,
                         comment: str = "mcp") -> dict:
     """
@@ -304,33 +349,57 @@ def place_pending_order(ctx: Context, symbol: str, volume: float, type: str,
       volume:  lot size
       type:    'BUY_LIMIT', 'SELL_LIMIT', 'BUY_STOP', 'SELL_STOP'
       price:   trigger price
-      sl:      stop loss (0 = none)
-      tp:      take profit (0 = none)
+      sl:      stop loss (omit or None for none)
+      tp:      take profit (omit or None for none)
     """
     mt5 = get_mt5()
+    order_type = type.upper()
     type_map = {
         "BUY_LIMIT": mt5.ORDER_TYPE_BUY_LIMIT,
         "SELL_LIMIT": mt5.ORDER_TYPE_SELL_LIMIT,
         "BUY_STOP": mt5.ORDER_TYPE_BUY_STOP,
         "SELL_STOP": mt5.ORDER_TYPE_SELL_STOP,
     }
-    type_int = type_map.get(type.upper())
+    type_int = type_map.get(order_type)
     if type_int is None:
         return {"error": f"Invalid type: {type}. Use BUY_LIMIT/SELL_LIMIT/BUY_STOP/SELL_STOP"}
+
+    # Validate pending trigger price relative to market
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return {"error": f"No tick data for {symbol}"}
+    if order_type == "BUY_LIMIT" and price >= tick.ask:
+        return {"error": f"BUY_LIMIT price must be below ask ({tick.ask})"}
+    if order_type == "SELL_LIMIT" and price <= tick.bid:
+        return {"error": f"SELL_LIMIT price must be above bid ({tick.bid})"}
+    if order_type == "BUY_STOP" and price <= tick.ask:
+        return {"error": f"BUY_STOP price must be above ask ({tick.ask})"}
+    if order_type == "SELL_STOP" and price >= tick.bid:
+        return {"error": f"SELL_STOP price must be below bid ({tick.bid})"}
+
+    # Validate SL/TP direction (map pending type to side)
+    side = "BUY" if order_type.startswith("BUY") else "SELL"
+    valid, reason = _sltp_valid(symbol, side, price, sl, tp)
+    if not valid:
+        return {"error": reason, "retcode": -1}
+
     request = {
         "action": mt5.TRADE_ACTION_PENDING,
         "symbol": symbol,
         "volume": volume,
         "type": type_int,
         "price": price,
-        "sl": sl,
-        "tp": tp,
         "deviation": deviation,
         "magic": magic,
         "comment": comment,
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": _filling_mode(),
     }
+    if sl is not None and sl > 0:
+        request["sl"] = sl
+    if tp is not None and tp > 0:
+        request["tp"] = tp
+
     result = mt5.order_send(request)
     if result is None:
         return {"error": str(mt5.last_error())}
@@ -440,8 +509,8 @@ def calculate_kelly_position(ctx: Context, symbol: str, entry: float, sl: float,
       sl:      stop loss price
       tp:      take profit price
       balance: current account balance (default 10000)
-      risk_pct: optional override (default: use MAX_RISK_PER_TRADE=1%)
-    Returns: {volume, risk_usd, reward_usd, rr_ratio, kelly_pct, merit_score, validation}
+      risk_pct: optional % of balance to risk (default: use MAX_RISK_PER_TRADE=1%)
+    Returns: {volume, risk_usd, reward_usd, rr_ratio, kelly_pct, merit_score, stop_pts, take_pts, validation}
     """
     mt5 = get_mt5()
     info = mt5.symbol_info(symbol)
@@ -450,7 +519,8 @@ def calculate_kelly_position(ctx: Context, symbol: str, entry: float, sl: float,
         return {"error": f"No market data for {symbol}"}
 
     point = info.point
-    price = tick.ask if entry >= tick.ask else tick.bid
+    tick_side = tick.ask if entry >= tick.ask else tick.bid
+
     stop_pts = abs(entry - sl) / point
     take_pts = abs(tp - entry) / point
 
@@ -463,22 +533,28 @@ def calculate_kelly_position(ctx: Context, symbol: str, entry: float, sl: float,
     if rr < MIN_RR_RATIO:
         return {"error": f"RR {rr}:1 < minimum {MIN_RR_RATIO}:1"}
 
-    risk_pct = risk_pct or (MAX_RISK_PER_TRADE * 100)
-    risk_usd = balance * (risk_pct / 100.0)
+    risk_pct_val = risk_pct if risk_pct is not None else MAX_RISK_PER_TRADE
+    risk_usd = balance * risk_pct_val
 
-    # Kelly: f* = (p*b - q) / b  — simplified using RR
-    p = 0.55  # assumed win prob (conservative)
+    # Use tick_value for accurate position sizing
+    tick_size = info.trade_tick_size if info.trade_tick_size and info.trade_tick_size > 0 else point
+    tick_value = info.trade_tick_value if info.trade_tick_value and info.trade_tick_value > 0 else 1.0
+    loss_per_lot = stop_pts * tick_value
+    volume = risk_usd / loss_per_lot if loss_per_lot > 0 else 0
+
+    # Quantize to volume_step
+    volume_step = info.volume_step if info.volume_step and info.volume_step > 0 else 0.01
+    volume = round(volume / volume_step) * volume_step
+
+    # Kelly cap
+    p = 0.55
     q = 1 - p
     kelly_raw = (p * rr - q) / rr if rr > 0 else 0
     kelly_frac = max(0, kelly_raw * KELLY_FRACTION)
-    kelly_pct = round(kelly_frac * 100, 2)
-
-    # Volume: risk-based capped by Kelly
-    contract = info.trade_contract_size
-    volume = risk_usd / (stop_pts * contract) if stop_pts > 0 else 0
     volume = min(volume, info.volume_max * kelly_frac) if kelly_frac > 0 else volume
-    volume = round(max(info.volume_min, min(info.volume_max, volume)), 2)
 
+    volume = round(max(info.volume_min, min(info.volume_max, volume)), 2)
+    kelly_pct = round(kelly_frac * 100, 2)
     merit = round(min(1.0, (rr / 3.0) * (p / 0.5)), 2)
 
     return {
@@ -491,6 +567,7 @@ def calculate_kelly_position(ctx: Context, symbol: str, entry: float, sl: float,
         "stop_pts": int(stop_pts),
         "take_pts": int(take_pts),
         "merit_score": merit,
+        "validation": "OK",
     }
 
 @mcp.tool()
@@ -514,13 +591,18 @@ def validate_trade_signal(ctx: Context, symbol: str, signal_type: str, entry: fl
     spread_pts = round((tick.ask - tick.bid) / point)
     checks = {}
 
-    # Spread check
-    avg_spread = info.spread_max / point if info.spread_max > 0 else 50
-    checks["spread"] = spread_pts <= avg_spread * 2
+    # Spread check — use live spread or symbol spread, not spread_max
+    baseline_spread = float(getattr(info, "spread", 50) or 50)
+    checks["spread"] = spread_pts <= baseline_spread * 2
     if not checks["spread"]:
-        return {"valid": False, "reason": f"Spread {spread_pts}pts > 2x avg {int(avg_spread)}pts"}
+        return {"valid": False, "reason": f"Spread {spread_pts}pts > 2x baseline {int(baseline_spread)}pts"}
 
-    # Stop level check
+    # Stop level check — side-aware
+    side = signal_type.upper()
+    valid_dir, dir_reason = _sltp_valid(symbol, side, entry, sl, tp)
+    if not valid_dir:
+        return {"valid": False, "reason": dir_reason}
+
     sl_pts = abs(entry - sl) / point
     checks["stops"] = sl_pts >= info.trade_stops_level
     if not checks["stops"]:

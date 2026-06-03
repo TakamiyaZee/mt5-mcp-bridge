@@ -161,26 +161,21 @@ def run_parallel_agents(symbols_data, balance, dry_run=True):
         mt5 = get_mt5()
         for sig in to_execute:
             if mt5:
-                tick = mt5.symbol_info_tick(sig["symbol"])
-                order_type = mt5.ORDER_TYPE_BUY if sig["signal"] == "BUY" else mt5.ORDER_TYPE_SELL
-                price = tick.ask if sig["signal"] == "BUY" else tick.bid
-                req = {
-                    "action": mt5.TRADE_ACTION_DEAL,
+                from mt5linux import MetaTrader5 as MT5
+                result = mt5.order_send({
+                    "action": MT5.TRADE_ACTION_DEAL if not dry_run else MT5.TRADE_ACTION_DEAL,
                     "symbol": sig["symbol"],
                     "volume": sig["position_size"],
-                    "type": order_type,
-                    "price": price,
+                    "type": MT5.ORDER_TYPE_BUY if sig["signal"] == "BUY" else MT5.ORDER_TYPE_SELL,
+                    "price": mt5.symbol_info_tick(sig["symbol"]).ask,
+                    "sl": sig["sl"],
+                    "tp": sig["tp"],
                     "deviation": 20,
                     "magic": 888888,
                     "comment": "HF_QUANT",
-                    "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_FOK,
-                }
-                if sig["sl"]:
-                    req["sl"] = sig["sl"]
-                if sig["tp"]:
-                    req["tp"] = sig["tp"]
-                result = mt5.order_send(req)
+                    "type_time": MT5.ORDER_TIME_GTC,
+                    "type_filling": MT5.ORDER_FILLING_IOC,
+                })
                 executed.append({"symbol": sig["symbol"], "order": result.order if result else None})
                 print(f"  EXECUTED {sig['symbol']}: ticket={result.order if result else 'err'}")
     else:

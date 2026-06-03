@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Quick test: verify server.py connects to bridge and account info works."""
 import sys, os, subprocess, time, json
+from pathlib import Path
 
-server = os.path.expanduser("~/.hermes/mcp-servers/mt5-mcp-server/server.py")
+server = str(Path(__file__).parent / "server.py")
 
 # Start server
 proc = subprocess.Popen(
@@ -21,7 +22,6 @@ time.sleep(2)
 
 # Try to read response
 import select
-import os as _os
 fl = select.poll()
 fl.register(proc.stdout, select.POLLIN)
 if fl.poll(5000):

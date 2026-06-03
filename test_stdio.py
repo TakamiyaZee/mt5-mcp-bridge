@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+"""Test server.py via stdio JSON-RPC initialize."""
 import subprocess, json, sys, time, os
+from pathlib import Path
 
-server = os.path.expanduser("~/.hermes/mcp-servers/mt5-mcp-server/server.py")
+server = str(Path(__file__).parent / "server.py")
 
 proc = subprocess.Popen(
     [sys.executable, server],
